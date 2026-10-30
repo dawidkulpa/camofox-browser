@@ -307,6 +307,36 @@ function createTestApp() {
     `);
   });
 
+  // Page with several upload controls, shaped like an ATS form: Photo comes first
+  app.get('/upload-many', (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Upload Many Test</title></head>
+      <body>
+        <h1>Upload Many Test Page</h1>
+        <form id="form">
+          <div><span>Photo</span><input type="file" id="photo" data-ui="avatar" aria-label="Photo" /></div>
+          <div id="resume-field"><span>Resume</span><input type="file" id="resume" data-ui="resume" aria-label="Resume" /></div>
+          <label id="cover-label">Cover letter<input type="file" id="cover" style="display:none" /></label>
+          <input type="file" id="hidden-doc" style="display:none" />
+        </form>
+        <button id="open-chooser" type="button">Add document</button>
+        <button id="mount-panel" type="button">Add portfolio</button>
+        <script>
+          document.getElementById('open-chooser').addEventListener('click', () => {
+            document.getElementById('hidden-doc').click();
+          });
+          document.getElementById('mount-panel').addEventListener('click', () => {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.id = 'panel';
+            document.getElementById('form').prepend(input);
+          });
+        </script>
+      </body></html>
+    `);
+  });
+
   app.get('/large-page', (req, res) => {
     const count = parseInt(req.query.count) || 500;
     const items = Array.from({ length: count }, (_, i) =>

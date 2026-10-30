@@ -4102,6 +4102,23 @@ const UPLOAD_PANEL_POLL_MS = 500; // interval between panel-input polls
 const UPLOAD_REFS_TIMEOUT_MS = 4000; // refreshTabRefs() before/after the upload
 const UPLOAD_SETTLE_MS = 1500; // let the page process the upload / render a preview
 
+// Runs in the page: the file input an upload target stands for -- the element
+// itself, the input its <label> controls, or the only file input inside it.
+function fileInputOfTarget(element) {
+  const isFileInput = (node) => Boolean(node?.matches?.('input[type="file"]'));
+  if (isFileInput(element)) return element;
+  const labelled = element.closest('label')?.control;
+  if (isFileInput(labelled)) return labelled;
+  const nested = element.querySelectorAll('input[type="file"]');
+  return nested.length === 1 ? nested[0] : null;
+}
+
+function uploadTargetError(message) {
+  const err = new Error(message);
+  err.statusCode = 422;
+  return err;
+}
+
 // Upload (file attach via filechooser / setInputFiles)
 /**
  * @openapi
@@ -4112,13 +4129,14 @@ const UPLOAD_SETTLE_MS = 1500; // let the page process the upload / render a pre
  *     description: >
  *       Attaches files from the configured upload directory without going through
  *       the native OS file dialog. Set CAMOFOX_UPLOADS_DIR to a directory that
- *       contains the files (default: ~/.camofox/uploads). Two strategies are
- *       tried in order: (1) if an
- *       <input type="file"> is already present, call Playwright setInputFiles
- *       on it directly (works for hidden inputs); (2) otherwise arm a
- *       filechooser listener, activate the trigger element (ref or selector)
- *       via keyboard (focus + Enter) then a forced click as fallback, and call
- *       setFiles on the resulting chooser. Each path must be an absolute path
+ *       contains the files (default: ~/.camofox/uploads). With a ref or selector
+ *       the file goes to that control only: (1) if it is, labels or wraps an
+ *       <input type="file">, call Playwright setInputFiles on that input (works
+ *       for hidden inputs); (2) otherwise arm a filechooser listener, activate
+ *       the trigger via keyboard (focus + Enter) then a forced click as fallback,
+ *       and use the input it mounts or the resulting chooser. Without a ref or
+ *       selector the page must hold exactly one file input. Each path must be an
+ *       absolute path
  *       that resolves inside the configured upload directory.
  *     parameters:
  *       - name: tabId
@@ -4157,6 +4175,8 @@ const UPLOAD_SETTLE_MS = 1500; // let the page process the upload / render a pre
  *         description: "File(s) attached."
  *       400:
  *         description: "Bad request (missing path/userId; non-regular file; or a path that is missing or outside the configured upload directory)."
+ *       422:
+ *         description: "The target cannot be resolved: a selector that does not match exactly one element, several file inputs and no ref or selector, or a trigger that opened no upload UI."
  *       404:
  *         description: "Tab not found."
  */
@@ -4172,6 +4192,8 @@ app.post('/tabs/:tabId/upload', async (req, res) => {
     if (!filePath) return res.status(400).json({ error: 'path required (container-side file path)' });
 
     const paths = await resolveUploadPaths({ uploadsDir: CONFIG.uploadsDir, filePaths: Array.isArray(filePath) ? filePath : [filePath] });
+    const selectorErr = selectorValidationError(selector);
+    if (selectorErr) throw invalidSelectorError(selectorErr);
 
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
@@ -4181,26 +4203,55 @@ app.post('/tabs/:tabId/upload', async (req, res) => {
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
 
     const result = await withUserLimit(userId, () => withTabLock(tabId, async () => {
-      const directInput = tabState.page.locator('input[type="file"]').first();
+      const fileInputs = tabState.page.locator('input[type="file"]');
       let attachedVia = null;
 
-      const trySetExistingInput = async () => {
+      const setFilesOn = async (input) => {
         try {
-          if (await directInput.count() > 0) {
-            await directInput.setInputFiles(paths, { timeout: UPLOAD_INPUT_TIMEOUT_MS });
-            return true;
-          }
+          await input.setInputFiles(paths, { timeout: UPLOAD_INPUT_TIMEOUT_MS });
+          return true;
         } catch (e) {
-          log('info', 'upload: setInputFiles on existing input failed', { error: e.message });
+          log('info', 'upload: setInputFiles failed', { error: e.message });
+          return false;
         }
-        return false;
       };
 
-      // Strategy 1: an <input type=file> already exists right now (an upload
-      // panel was opened before this call) -> set files directly. setInputFiles
-      // works on hidden inputs and skips the OS dialog entirely.
-      if (await trySetExistingInput()) {
-        attachedVia = 'direct_input';
+      // The control the caller named. A target that cannot be found is an error:
+      // falling back to whichever input comes first puts the file in the wrong
+      // field and still reports success.
+      let target = null;
+      if (ref) {
+        target = refToLocator(tabState.page, ref, tabState.refs);
+        if (!target) {
+          try {
+            tabState.refs = await refreshTabRefs(tabState, { reason: 'pre_upload', timeoutMs: UPLOAD_REFS_TIMEOUT_MS });
+          } catch (e) { /* proceed without refresh */ }
+          target = refToLocator(tabState.page, ref, tabState.refs);
+        }
+        if (!target) {
+          const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none';
+          throw new StaleRefsError(ref, maxRef, tabState.refs.size);
+        }
+      } else if (selector) {
+        target = tabState.page.locator(selector);
+        const matches = await target.count();
+        if (matches !== 1) {
+          throw uploadTargetError(`Selector matched ${matches} elements, expected exactly one. Call snapshot and use a current element ref or a matching selector.`);
+        }
+      }
+
+      // Strategy 1: the target is, labels or wraps a file input -> set files
+      // directly. setInputFiles works on hidden inputs and skips the OS dialog.
+      // Without a target only a lone input is unambiguous.
+      if (target) {
+        const input = (await target.evaluateHandle(fileInputOfTarget, null, { timeout: UPLOAD_INPUT_TIMEOUT_MS })).asElement();
+        if (input && await setFilesOn(input)) attachedVia = 'direct_input';
+      } else {
+        const count = await fileInputs.count();
+        if (count > 1) {
+          throw uploadTargetError(`Page has ${count} file inputs. Give the one to use as ref or selector.`);
+        }
+        if (count === 1 && await setFilesOn(fileInputs)) attachedVia = 'direct_input';
       }
 
       // Strategy 2: activate the trigger element, then handle EITHER UI path:
@@ -4211,26 +4262,22 @@ app.post('/tabs/:tabId/upload', async (req, res) => {
       // arm the filechooser listener BEFORE clicking and then race it against
       // polling for a freshly-mounted input. Whichever resolves first wins.
       if (!attachedVia) {
-        let locator;
-        if (ref) {
-          locator = refToLocator(tabState.page, ref, tabState.refs);
-          if (!locator) {
-            try {
-              tabState.refs = await refreshTabRefs(tabState, { reason: 'pre_upload', timeoutMs: UPLOAD_REFS_TIMEOUT_MS });
-            } catch (e) { /* proceed without refresh */ }
-            locator = refToLocator(tabState.page, ref, tabState.refs);
-          }
-          if (!locator) {
-            const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none';
-            throw new StaleRefsError(ref, maxRef, tabState.refs.size);
-          }
-        } else if (selector) {
-          locator = tabState.page.locator(selector);
-        } else {
+        if (!target) {
           const err = new Error('No input[type=file] present and no ref/selector trigger provided.');
           err.statusCode = 400;
           throw err;
         }
+
+        // Inputs already on the page belong to other controls; only one the
+        // trigger mounts counts as its panel.
+        const knownInputs = await fileInputs.elementHandles();
+        const findMountedInput = async () => {
+          const index = await tabState.page.evaluate(
+            ([known]) => [...document.querySelectorAll('input[type="file"]')].findIndex((input) => !known.includes(input)),
+            [knownInputs],
+          );
+          return index === -1 ? null : fileInputs.nth(index);
+        };
 
         // Arm the filechooser listener FIRST (catch a no-quotes rejection so an
         // unfired listener never crashes the handler), then activate the trigger.
@@ -4238,10 +4285,10 @@ app.post('/tabs/:tabId/upload', async (req, res) => {
           .waitForEvent('filechooser', { timeout: uploadTimeout })
           .catch(() => null);
         try {
-          await locator.focus({ timeout: UPLOAD_FOCUS_TIMEOUT_MS });
+          await target.focus({ timeout: UPLOAD_FOCUS_TIMEOUT_MS });
           await tabState.page.keyboard.press('Enter');
         } catch (e) {
-          try { await locator.click({ timeout: UPLOAD_CLICK_TIMEOUT_MS, force: true }); } catch (e2) { /* chooser/panel may still appear */ }
+          try { await target.click({ timeout: UPLOAD_CLICK_TIMEOUT_MS, force: true }); } catch (e2) { /* chooser/panel may still appear */ }
         }
 
         // The trigger may surface EITHER UI path (LinkedIn A/B-tests both, and
@@ -4256,7 +4303,8 @@ app.post('/tabs/:tabId/upload', async (req, res) => {
         const panelWindow = Math.max(UPLOAD_PANEL_POLL_MS, uploadTimeout - UPLOAD_PANEL_MARGIN_MS);
         const deadline = Date.now() + panelWindow;
         while (!attachedVia && Date.now() < deadline) {
-          if (await trySetExistingInput()) { attachedVia = 'panel_input'; break; }
+          const mounted = await findMountedInput();
+          if (mounted && await setFilesOn(mounted)) { attachedVia = 'panel_input'; break; }
           await tabState.page.waitForTimeout(UPLOAD_PANEL_POLL_MS);
         }
         if (!attachedVia) {
@@ -4279,9 +4327,7 @@ app.post('/tabs/:tabId/upload', async (req, res) => {
         // setFiles (that was the source of the duplicate-image bug).
 
         if (!attachedVia) {
-          const err = new Error('Upload trigger did not open a file chooser or mount a file input.');
-          err.statusCode = 422;
-          throw err;
+          throw uploadTargetError('Upload trigger did not open a file chooser or mount a file input.');
         }
       }
 
